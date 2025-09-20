@@ -26,7 +26,7 @@
 # .\venv\Scripts\Activate.ps1
 
 import argparse, csv, json, os, subprocess, math, time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 import urllib.request
 
@@ -36,7 +36,7 @@ EARTH_RADIUS_MI = 3958.7613
 
 EXIFTOOL_FIELDS = [
     # Dates
-    "DateTimeOriginal", "CreateDate",
+    "DateTimeOriginal", "CreateDate", "OffsetTimeOriginal", "OffsetTime", "OffsetTimeDigitized",
     # GPS
     "GPSLatitude", "GPSLongitude", "GPSAltitude",
     # Camera basics
@@ -64,10 +64,24 @@ def run_exiftool(path):
 
 def parse_dt(meta, path):
     raw = meta.get("DateTimeOriginal") or meta.get("CreateDate")
+    # EXIF may include timezone offset fields like OffsetTimeOriginal
+    offset_raw = meta.get("OffsetTimeOriginal") or meta.get("OffsetTime") or meta.get("OffsetTimeDigitized")
     if raw:
         for fmt in ("%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
             try:
                 dt = datetime.strptime(raw, fmt)
+                # Attach tzinfo if an EXIF offset is present
+                if offset_raw:
+                    try:
+                        # offset_raw expected like '+01:00' or '-05:30'
+                        sign = 1 if offset_raw[0] != '-' else -1
+                        parts = offset_raw[1:].split(":")
+                        oh = int(parts[0]) if parts[0] else 0
+                        om = int(parts[1]) if len(parts) > 1 else 0
+                        tz = timezone(timedelta(hours=sign * oh, minutes=sign * om))
+                        return dt.replace(tzinfo=tz)
+                    except Exception:
+                        pass
                 return dt
             except Exception:
                 pass
@@ -109,7 +123,7 @@ def pick_neighborhood(addr):
     return None
 
 
-def reverse_geocode(lat, lon, user_agent, sleep_between=1.0):
+def reverse_geocode(lat, lon, user_agent_email, sleep_between=1.0):
     params = {
         "format": "jsonv2",
         "lat": f"{lat}",
@@ -118,7 +132,9 @@ def reverse_geocode(lat, lon, user_agent, sleep_between=1.0):
         "addressdetails": 1,
     }
     url = "https://nominatim.openstreetmap.org/reverse?" + urlencode(params)
+    user_agent = f"custom-photo-organizer/1.0 (contact: {user_agent_email})"
     req = urllib.request.Request(url, headers={"User-Agent": user_agent})
+    print(f"Reverse geocoding: {lat},{lon} ... ", end="", flush=True)
     with urllib.request.urlopen(req, timeout=20) as resp:
         data = json.loads(resp.read().decode("utf-8", "ignore"))
     time.sleep(max(0.0, sleep_between))
@@ -158,6 +174,21 @@ def slugify(s):
     return s or "UnknownLocation"
 
 
+def parse_utc_offset(tz_str):
+    """Parse a timezone string like 'UTC+05:30' and return a timedelta or None."""
+    if not tz_str or not tz_str.startswith("UTC"):
+        return None
+    try:
+        sign_char = tz_str[3]
+        if sign_char not in "+-":
+            return None
+        sign = 1 if sign_char == "+" else -1
+        hh = int(tz_str[4:6])
+        mm = int(tz_str[7:9]) if len(tz_str) >= 9 else 0
+        return timedelta(hours=sign * hh, minutes=sign * mm)
+    except Exception:
+        return None
+
 # ---------- main ----------
 
 def build_catalog(src, out_csv, user_agent, sleep, radius_mi, cache_file):
@@ -181,8 +212,13 @@ def build_catalog(src, out_csv, user_agent, sleep, radius_mi, cache_file):
         except Exception:
             anchors = []
 
+    # No GPS-based timezone lookup. Timezone comes only from EXIF offset when available.
+    tf = None
+
     rows = []
     created = 0
+
+    prev_lat = prev_lon = prev_dt = None
 
     for idx, p in enumerate(files, 1):
         meta = run_exiftool(p)
@@ -190,6 +226,20 @@ def build_catalog(src, out_csv, user_agent, sleep, radius_mi, cache_file):
         date_str = dt.date().isoformat()
         time_str = dt.time().isoformat(timespec="seconds")
         gps = get_latlon(meta)
+
+        # Prefer EXIF timezone offset if present on the parsed datetime.
+        timezone = ""
+        if dt.tzinfo is not None:
+            try:
+                off = dt.tzinfo.utcoffset(dt)
+                if off is not None:
+                    total_minutes = int(off.total_seconds() / 60)
+                    sign = "+" if total_minutes >= 0 else "-"
+                    hh = abs(total_minutes) // 60
+                    mm = abs(total_minutes) % 60
+                    timezone = f"UTC{sign}{hh:02d}:{mm:02d}"
+            except Exception:
+                timezone = ""
 
         # Defaults
         label = "UnknownLocation"
@@ -204,6 +254,41 @@ def build_catalog(src, out_csv, user_agent, sleep, radius_mi, cache_file):
                 if haversine_miles(lat, lon, a["lat"], a["lon"]) <= radius_mi:
                     match = a
                     break
+            if prev_lat is not None and prev_lon is not None:
+                dist_from_prev_pic = haversine_miles(lat, lon, prev_lat, prev_lon)
+                # Compute elapsed hours robustly.
+                try:
+                    if dt.tzinfo is not None and prev_dt.tzinfo is not None:
+                        # Both datetimes are timezone-aware: use UTC-normalized difference (no further offset correction needed).
+                        delta_sec = (dt.astimezone(timezone.utc) - prev_dt.astimezone(timezone.utc)).total_seconds()
+                        hrs = abs(delta_sec) / 3600.0
+                    else:
+                        # Naive subtraction (wall-clock) — compensate using EXIF-derived timezone strings if available.
+                        delta_sec = (dt - prev_dt).total_seconds()
+                        hrs = abs(delta_sec) / 3600.0
+                        if prev_tz and timezone and prev_tz != timezone:
+                            try:
+                                prev_off = parse_utc_offset(prev_tz) or (prev_dt.tzinfo.utcoffset(prev_dt) if prev_dt.tzinfo else timedelta(0))
+                                curr_off = parse_utc_offset(timezone) or (dt.tzinfo.utcoffset(dt) if dt.tzinfo else timedelta(0))
+                                off_diff = (curr_off - prev_off).total_seconds() / 3600.0
+                                hrs += off_diff
+                                hrs = max(hrs, 0.0)
+                            except Exception:
+                                pass
+                except Exception:
+                    hrs = abs((dt - prev_dt).total_seconds()) / 3600.0
+
+                speed_mph = dist_from_prev_pic / hrs if hrs > 0 else None
+            else:
+                dist_from_prev_pic = None
+                speed_mph = None
+                hrs = None
+
+            # save for next iteration
+            prev_lat, prev_lon = lat, lon
+            prev_dt = dt
+            prev_tz = timezone
+
             if match:
                 city_label = match["city_label"]
                 hood = match.get("neighborhood", "")
@@ -211,6 +296,7 @@ def build_catalog(src, out_csv, user_agent, sleep, radius_mi, cache_file):
                 state = match.get("state", "")
                 country_code = match.get("country_code", "")
                 label = match["folder_label"]
+                # Do not use cached anchor timezone; prefer EXIF offset only
             else:
                 try:
                     rg = reverse_geocode(lat, lon, user_agent, sleep_between=sleep)
@@ -232,6 +318,12 @@ def build_catalog(src, out_csv, user_agent, sleep, radius_mi, cache_file):
                     "folder_label": label,
                 })
                 created += 1
+
+        else:
+            dist_from_prev_pic = None
+            speed_mph = None
+            hrs = None
+
         # Build proposed folder
         proposed = f"{slugify(label)}_{date_str}"
 
@@ -240,8 +332,14 @@ def build_catalog(src, out_csv, user_agent, sleep, radius_mi, cache_file):
             "file_name": os.path.basename(p),
             "date": date_str,
             "time": time_str,
+            "timezone": timezone,
             "lat": gps[0] if gps else "",
             "lon": gps[1] if gps else "",
+            "geo_source": "EXIF" if gps else "Unknown",
+            "miles_from_prev_pic": f"{dist_from_prev_pic:.2f}" if dist_from_prev_pic is not None else "",
+            "hrs_from_prev_pic": f"{hrs:.2f}" if hrs is not None else "",
+            "mph_from_prev_pic": f"{speed_mph:.2f}" if speed_mph is not None else "",
+
             # place levels
             "city_label": city_label,
             "neighborhood": hood,
@@ -271,6 +369,38 @@ def build_catalog(src, out_csv, user_agent, sleep, radius_mi, cache_file):
         if idx > 50:
             break
 
+    # Infer missing GPS by temporal proximity (<= 60 minutes)
+    # For any row where geo_source is 'Unknown' and lat/lon are empty,
+    # pick the lat/lon from the photo closest in date/time (within 60 minutes)
+    known = []
+    for r in rows:
+        if r.get("lat") != "" and r.get("lon") != "":
+            try:
+                known_dt = datetime.fromisoformat(r["date"] + "T" + r["time"])
+                known.append((known_dt, float(r["lat"]), float(r["lon"])))
+            except Exception:
+                # skip rows with unparsable dates
+                continue
+
+    MAX_MINUTES = 60
+    for r in rows:
+        if r.get("geo_source", "") == "Unknown" and (r.get("lat") == "" or r.get("lon") == ""):
+            try:
+                r_dt = datetime.fromisoformat(r["date"] + "T" + r["time"])
+            except Exception:
+                continue
+            best = None
+            best_delta = None
+            for kdt, klat, klon in known:
+                delta_min = abs((kdt - r_dt).total_seconds()) / 60.0
+                if delta_min <= MAX_MINUTES and (best is None or delta_min < best_delta):
+                    best = (klat, klon)
+                    best_delta = delta_min
+            if best:
+                r["lat"], r["lon"] = best
+                r["geo_source"] = "inferred"
+                # Do not populate timezone from inferred GPS; timezone remains EXIF-derived (if any)
+
     # write CSV
     fieldnames = list(rows[0].keys()) + ["final_folder"]  # reserve column for edits
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
@@ -296,7 +426,9 @@ if __name__ == "__main__":
     ap.add_argument("--user-agent", required=True, help="Include contact info per Nominatim policy")
     ap.add_argument("--sleep", help="Sleep time between requests (seconds)", type=float, default=1.0)
     ap.add_argument("--radius-mi", help="Radius for reverse geocoding (miles)", type=float, default=10.0)
-    ap.add_argument("--cache-file", help="Path to cache file", default="")
+    ap.add_argument("--cache-file", help="Path to cache file", default="anchors.json")
     args = ap.parse_args()
     build_catalog(args.src, args.out, args.user_agent, args.sleep, args.radius_mi, args.cache_file)
 
+
+# python.exe .\build_photo_catalog.py --src D:\Pictures_Home\by-camera-after-2010\brian-pixel7-pro\0-staging\Camera\ --out tmp.csv --user-agent bandrewfox@gmail.com
