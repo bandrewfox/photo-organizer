@@ -30,7 +30,7 @@ from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode
 import urllib.request
 
-EXIF_TOOL_PATH = "C:/Program Files/exiftool-13.36_64"
+EXIF_TOOL_PATH = r"C:\Program Files\exiftool-13.36_64\exiftool.exe"
 
 EARTH_RADIUS_MI = 3958.7613
 
@@ -50,7 +50,7 @@ EXIFTOOL_FIELDS = [
 
 def run_exiftool(path):
     cmd = [
-        f"{EXIF_TOOL_PATH}/exiftool", "-m", "-api", "largefilesupport=1", "-j", "-n",
+        EXIF_TOOL_PATH, "-m", "-api", "largefilesupport=1", "-j", "-n",
         *[f"-{t}" for t in EXIFTOOL_FIELDS],
         path,
     ]
@@ -60,6 +60,43 @@ def run_exiftool(path):
         return arr[0] if arr else {}
     except Exception:
         return {}
+
+
+def run_exiftool_batch(paths, exiftool_exe, fields, batch_size=100, test50=False):
+    """
+    Run exiftool on paths in batches. Returns {path: metadata_dict}.
+    """
+    out = {}
+    for i in range(0, len(paths), batch_size):
+        batch = paths[i:i+batch_size]
+        cmd = [exiftool_exe, "-m", "-api", "largefilesupport=1", "-j", "-n", *[f"-{f}" for f in fields], *batch]
+        try:
+            print(f"  EXIF batch {i+1}-{i+len(batch)} ... ", end="", flush=True)
+            raw = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+            arr = json.loads(raw.decode("utf-8", "ignore"))
+            for obj in arr:
+                # exiftool's JSON objects include "SourceFile"
+                src = obj.get("SourceFile")
+                if src:
+                    # Normalize path casing and separators so keys match os.path.join output on Windows
+                    key = os.path.normcase(os.path.normpath(src))
+                    out[key] = obj
+        except Exception:
+            # fallback: try per-file to avoid losing data on a batch error
+            for p in batch:
+                try:
+                    raw = subprocess.check_output([exiftool_exe, "-m", "-api", "largefilesupport=1", "-j", "-n", *[f"-{f}" for f in fields], p], stderr=subprocess.DEVNULL)
+                    arr = json.loads(raw.decode("utf-8", "ignore"))
+                    if arr:
+                        # Normalize the per-file key the same way
+                        key = os.path.normcase(os.path.normpath(p))
+                        out[key] = arr[0]
+                except Exception:
+                    key = os.path.normcase(os.path.normpath(p))
+                    out[key] = {}
+        if test50 and batch_size >= 50:
+            break
+    return out
 
 
 def parse_dt(meta, path):
@@ -191,7 +228,7 @@ def parse_utc_offset(tz_str):
 
 # ---------- main ----------
 
-def build_catalog(src, out_csv, user_agent, sleep, radius_mi, cache_file):
+def build_catalog(src, out_csv, user_agent, sleep, radius_mi, cache_file, test50=False):
     # discover files
     files = []
     for root, _, names in os.walk(src):
@@ -202,6 +239,13 @@ def build_catalog(src, out_csv, user_agent, sleep, radius_mi, cache_file):
         raise SystemExit("No JPG/JPEG files found.")
 
     files.sort(key=lambda p: os.path.getmtime(p))
+
+    # Pre-read EXIF metadata in batches to avoid spawning exiftool per-file
+    try:
+        print(f"Reading EXIF metadata in batches ({len(files)} files)...")
+        meta_map = run_exiftool_batch(files, EXIF_TOOL_PATH, EXIFTOOL_FIELDS, batch_size=100, test50=test50)
+    except Exception:
+        meta_map = {}
 
     # load cache
     anchors = []
@@ -221,7 +265,16 @@ def build_catalog(src, out_csv, user_agent, sleep, radius_mi, cache_file):
     prev_lat = prev_lon = prev_dt = None
 
     for idx, p in enumerate(files, 1):
-        meta = run_exiftool(p)
+        # print(f"Processing {idx}/{len(files)}: {p}")
+        # Use batch metadata when available; fall back to single-file call if necessary.
+        lookup_key = os.path.normcase(os.path.normpath(p))
+        meta = meta_map.get(lookup_key)
+        if meta is None:
+            print(f"  (EXIF missing from batch, running single on {p}) ... ", end="", flush=True)
+            # (debug) show whether our normalized keys include this file
+            print(f" Keys(sample)={list(meta_map.keys())[:5]}")
+            meta = run_exiftool(p)
+        # print(f"Done processing EXIF.")
         dt = parse_dt(meta, p)
         date_str = dt.date().isoformat()
         time_str = dt.time().isoformat(timespec="seconds")
@@ -264,8 +317,11 @@ def build_catalog(src, out_csv, user_agent, sleep, radius_mi, cache_file):
                         hrs = abs(delta_sec) / 3600.0
                     else:
                         # Naive subtraction (wall-clock) — compensate using EXIF-derived timezone strings if available.
-                        delta_sec = (dt - prev_dt).total_seconds()
-                        hrs = abs(delta_sec) / 3600.0
+                        try:
+                            delta_sec = (dt - prev_dt).total_seconds()
+                            hrs = abs(delta_sec) / 3600.0
+                        except Exception:
+                            delta_sec = 0
                         if prev_tz and timezone and prev_tz != timezone:
                             try:
                                 prev_off = parse_utc_offset(prev_tz) or (prev_dt.tzinfo.utcoffset(prev_dt) if prev_dt.tzinfo else timedelta(0))
@@ -366,7 +422,7 @@ def build_catalog(src, out_csv, user_agent, sleep, radius_mi, cache_file):
             print(f"Cataloged {idx}/{len(files)}... (new anchors this run: {created})")
         
         # temporary: limit to first 50 for testing
-        if idx > 50:
+        if test50 and idx > 50:
             break
 
     # Infer missing GPS by temporal proximity (<= 60 minutes)
@@ -427,8 +483,9 @@ if __name__ == "__main__":
     ap.add_argument("--sleep", help="Sleep time between requests (seconds)", type=float, default=1.0)
     ap.add_argument("--radius-mi", help="Radius for reverse geocoding (miles)", type=float, default=10.0)
     ap.add_argument("--cache-file", help="Path to cache file", default="anchors.json")
+    ap.add_argument("--test50", action="store_true", help="(dev) Limit to first 50 photos")
     args = ap.parse_args()
-    build_catalog(args.src, args.out, args.user_agent, args.sleep, args.radius_mi, args.cache_file)
+    build_catalog(args.src, args.out, args.user_agent, args.sleep, args.radius_mi, args.cache_file, test50=args.test50)
 
 
 # python.exe .\build_photo_catalog.py --src D:\Pictures_Home\by-camera-after-2010\brian-pixel7-pro\0-staging\Camera\ --out tmp.csv --user-agent bandrewfox@gmail.com
