@@ -233,7 +233,7 @@ def build_catalog(src, out_csv, user_agent, sleep, radius_mi, cache_file, test50
     files = []
     for root, _, names in os.walk(src):
         for n in names:
-            if n.lower().endswith((".jpg", ".jpeg")):
+            if n.lower().endswith((".jpg", ".jpeg", ".mp4")):
                 files.append(os.path.join(root, n))
     if not files:
         raise SystemExit("No JPG/JPEG files found.")
